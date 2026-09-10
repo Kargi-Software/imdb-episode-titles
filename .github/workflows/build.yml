@@ -22,7 +22,8 @@ jobs:
           curl -L https://datasets.imdbws.com/title.basics.tsv.gz | gunzip -c > data/basics.tsv
           curl -L https://datasets.imdbws.com/title.crew.tsv.gz | gunzip -c > data/crew.tsv
           curl -L https://datasets.imdbws.com/title.principals.tsv.gz | gunzip -c > data/principals.tsv
-          ls -lh data
+          curl -L https://datasets.imdbws.com/title.episode.tsv.gz | gunzip -c > data/episode.tsv
+          head -n 2 data/*.tsv
 
       - name: Build
         run: |
@@ -33,6 +34,17 @@ jobs:
 
           OUT = "out/titles"
           os.makedirs(OUT, exist_ok=True)
+
+          # episode.tsv -> parent, season, episode
+          ep_info = {}
+          with open("data/episode.tsv", encoding="utf-8") as f:
+              r = csv.DictReader(f, delimiter="\t")
+              for row in r:
+                  ep_info[row["tconst"]] = {
+                      "parentId": row["parentTconst"] if row["parentTconst"] != "\\N" else None,
+                      "seasonNumber": int(row["seasonNumber"]) if row["seasonNumber"] != "\\N" else None,
+                      "episodeNumber": int(row["episodeNumber"]) if row["episodeNumber"] != "\\N" else None,
+                  }
 
           crew = {}
           with open("data/crew.tsv", encoding="utf-8") as f:
@@ -58,19 +70,21 @@ jobs:
               for row in r:
                   if row["titleType"] != "tvEpisode":
                       continue
-                  if row["parentTconst"] == "\\N":
+                  tid = row["tconst"]
+                  info = ep_info.get(tid)
+                  if not info or not info["parentId"]:
                       continue
 
-                  tid = row["tconst"]
                   shard = tid[2:4]
                   d, w = crew.get(tid, ([], []))
 
                   obj = {
                       "id": tid,
                       "title": row["primaryTitle"] if row["primaryTitle"] != "\\N" else None,
-                      "parentId": row["parentTconst"],
-                      "seasonNumber": int(row["seasonNumber"]) if row["seasonNumber"] != "\\N" else None,
-                      "episodeNumber": int(row["episodeNumber"]) if row["episodeNumber"] != "\\N" else None,
+                      "type": "tvEpisode",
+                      "parentId": info["parentId"],
+                      "seasonNumber": info["seasonNumber"],
+                      "episodeNumber": info["episodeNumber"],
                       "startYear": int(row["startYear"]) if row["startYear"] != "\\N" else None,
                       "runtime": int(row["runtimeMinutes"]) if row["runtimeMinutes"] != "\\N" else None,
                       "genres": row["genres"].split(",") if row["genres"] != "\\N" else [],
