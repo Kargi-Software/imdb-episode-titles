@@ -19,9 +19,10 @@ jobs:
       - name: Download IMDb Datasets
         run: |
           mkdir -p data
-          wget -q https://datasets.imdbws.com/title.basics.tsv.gz -O data/basics.tsv.gz
-          wget -q https://datasets.imdbws.com/title.crew.tsv.gz -O data/crew.tsv.gz
-          wget -q https://datasets.imdbws.com/title.principals.tsv.gz -O data/principals.tsv.gz
+          wget -qO - https://datasets.imdbws.com/title.basics.tsv.gz | gunzip -c > data/title.basics.tsv
+          wget -qO - https://datasets.imdbws.com/title.crew.tsv.gz | gunzip -c > data/title.crew.tsv
+          wget -qO - https://datasets.imdbws.com/title.principals.tsv.gz | gunzip -c > data/title.principals.tsv
+          ls -lh data/imdbws.com/title.principals.tsv.gz -O data/principals.tsv.gz
           gzip -d data/*.gz
 
       - name: Build episodes
