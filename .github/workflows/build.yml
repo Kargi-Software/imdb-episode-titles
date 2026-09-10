@@ -1,0 +1,103 @@
+name: Build Episode Titles
+
+on:
+  schedule:
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Download IMDb Datasets
+        run: |
+          mkdir -p data
+          wget -q https://datasets.imdbws.com/title.basics.tsv.gz -O data/basics.tsv.gz
+          wget -q https://datasets.imdbws.com/title.crew.tsv.gz -O data/crew.tsv.gz
+          wget -q https://datasets.imdbws.com/title.principals.tsv.gz -O data/principals.tsv.gz
+          gzip -d data/*.gz
+
+      - name: Build episodes
+        run: |
+          python - << 'PY'
+          import csv, json, os
+          from collections import defaultdict
+          import datetime
+
+          OUT = "out/titles"
+          os.makedirs(OUT, exist_ok=True)
+
+          crew = {}
+          with open("data/title.crew.tsv", encoding="utf-8") as f:
+              r = csv.DictReader(f, delimiter="\t")
+              for row in r:
+                  d = row["directors"].split(",")[:1] if row["directors"] != "\\N" else []
+                  w = row["writers"].split(",")[:2] if row["writers"] != "\\N" else []
+                  crew[row["tconst"]] = (d, w)
+
+          principals = defaultdict(list)
+          with open("data/title.principals.tsv", encoding="utf-8") as f:
+              r = csv.DictReader(f, delimiter="\t")
+              for row in r:
+                  if row["category"] not in ("actor","actress"):
+                      continue
+                  if len(principals[row["tconst"]]) >= 3:
+                      continue
+                  principals[row["tconst"]].append(row["nconst"])
+
+          count = 0
+          with open("data/title.basics.tsv", encoding="utf-8") as f:
+              r = csv.DictReader(f, delimiter="\t")
+              for row in r:
+                  if row["titleType"] != "tvEpisode":
+                      continue
+                  if row["parentTconst"] == "\\N":
+                      continue
+
+                  tid = row["tconst"]
+                  shard = tid[2:4]
+                  d, w = crew.get(tid, ([], []))
+
+                  obj = {
+                      "id": tid,
+                      "title": row["primaryTitle"] if row["primaryTitle"] != "\\N" else None,
+                      "originalTitle": row["originalTitle"] if row["originalTitle"] != "\\N" and row["originalTitle"] != row["primaryTitle"] else None,
+                      "type": "tvEpisode",
+                      "parentId": row["parentTconst"],
+                      "seasonNumber": int(row["seasonNumber"]) if row["seasonNumber"] != "\\N" else None,
+                      "episodeNumber": int(row["episodeNumber"]) if row["episodeNumber"] != "\\N" else None,
+                      "startYear": int(row["startYear"]) if row["startYear"] != "\\N" else None,
+                      "runtime": int(row["runtimeMinutes"]) if row["runtimeMinutes"] != "\\N" else None,
+                      "genres": row["genres"].split(",") if row["genres"] != "\\N" else [],
+                      "directors": [{"id": x} for x in d],
+                      "writers": [{"id": x} for x in w],
+                      "actors": [{"id": x} for x in principals.get(tid, [])]
+                  }
+                  obj = {k: v for k, v in obj.items() if v not in (None, [], {}) or k in ("id", "type", "parentId")}
+
+                  dir_path = f"{OUT}/{shard}"
+                  os.makedirs(dir_path, exist_ok=True)
+                  with open(f"{dir_path}/{tid}.json", "w", encoding="utf-8") as out:
+                      json.dump(obj, out, ensure_ascii=False, separators=(',', ':'))
+
+                  count += 1
+
+          with open("out/version.json", "w") as vf:
+              json.dump({"updated": datetime.datetime.utcnow().isoformat(), "count": count}, vf)
+
+          print(f"built {count} episodes")
+          PY
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./out
+          publish_branch: gh-pages
