@@ -2,7 +2,7 @@ name: Build Episode Titles
 
 on:
   schedule:
-    - cron: '0 2 * * 1'
+    - cron: '0 3 * * 1'
   workflow_dispatch:
 
 jobs:
@@ -16,18 +16,17 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Download IMDb Datasets
+      - name: Download IMDb
         run: |
           mkdir -p data
-          wget -qO - https://datasets.imdbws.com/title.basics.tsv.gz | gunzip -c > data/title.basics.tsv
-          wget -qO - https://datasets.imdbws.com/title.crew.tsv.gz | gunzip -c > data/title.crew.tsv
-          wget -qO - https://datasets.imdbws.com/title.principals.tsv.gz | gunzip -c > data/title.principals.tsv
-          ls -lh data/imdbws.com/title.principals.tsv.gz -O data/principals.tsv.gz
-          gzip -d data/*.gz
+          curl -L https://datasets.imdbws.com/title.basics.tsv.gz | gunzip -c > data/basics.tsv
+          curl -L https://datasets.imdbws.com/title.crew.tsv.gz | gunzip -c > data/crew.tsv
+          curl -L https://datasets.imdbws.com/title.principals.tsv.gz | gunzip -c > data/principals.tsv
+          ls -lh data
 
-      - name: Build episodes
+      - name: Build
         run: |
-          python - << 'PY'
+          python3 << 'PY'
           import csv, json, os
           from collections import defaultdict
           import datetime
@@ -36,7 +35,7 @@ jobs:
           os.makedirs(OUT, exist_ok=True)
 
           crew = {}
-          with open("data/title.crew.tsv", encoding="utf-8") as f:
+          with open("data/crew.tsv", encoding="utf-8") as f:
               r = csv.DictReader(f, delimiter="\t")
               for row in r:
                   d = row["directors"].split(",")[:1] if row["directors"] != "\\N" else []
@@ -44,17 +43,17 @@ jobs:
                   crew[row["tconst"]] = (d, w)
 
           principals = defaultdict(list)
-          with open("data/title.principals.tsv", encoding="utf-8") as f:
+          with open("data/principals.tsv", encoding="utf-8") as f:
               r = csv.DictReader(f, delimiter="\t")
               for row in r:
-                  if row["category"] not in ("actor","actress"):
+                  if row["category"] not in ("actor", "actress"):
                       continue
                   if len(principals[row["tconst"]]) >= 3:
                       continue
                   principals[row["tconst"]].append(row["nconst"])
 
           count = 0
-          with open("data/title.basics.tsv", encoding="utf-8") as f:
+          with open("data/basics.tsv", encoding="utf-8") as f:
               r = csv.DictReader(f, delimiter="\t")
               for row in r:
                   if row["titleType"] != "tvEpisode":
@@ -69,8 +68,6 @@ jobs:
                   obj = {
                       "id": tid,
                       "title": row["primaryTitle"] if row["primaryTitle"] != "\\N" else None,
-                      "originalTitle": row["originalTitle"] if row["originalTitle"] != "\\N" and row["originalTitle"] != row["primaryTitle"] else None,
-                      "type": "tvEpisode",
                       "parentId": row["parentTconst"],
                       "seasonNumber": int(row["seasonNumber"]) if row["seasonNumber"] != "\\N" else None,
                       "episodeNumber": int(row["episodeNumber"]) if row["episodeNumber"] != "\\N" else None,
@@ -81,12 +78,12 @@ jobs:
                       "writers": [{"id": x} for x in w],
                       "actors": [{"id": x} for x in principals.get(tid, [])]
                   }
-                  obj = {k: v for k, v in obj.items() if v not in (None, [], {}) or k in ("id", "type", "parentId")}
+                  obj = {k: v for k, v in obj.items() if v not in (None, [], {}) or k in ("id", "parentId")}
 
                   dir_path = f"{OUT}/{shard}"
                   os.makedirs(dir_path, exist_ok=True)
                   with open(f"{dir_path}/{tid}.json", "w", encoding="utf-8") as out:
-                      json.dump(obj, out, ensure_ascii=False, separators=(',', ':'))
+                      json.dump(obj, out, ensure_ascii=False, separators=(",", ":"))
 
                   count += 1
 
@@ -96,7 +93,7 @@ jobs:
           print(f"built {count} episodes")
           PY
 
-      - name: Deploy to gh-pages
+      - name: Deploy
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
