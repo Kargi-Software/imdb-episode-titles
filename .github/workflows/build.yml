@@ -1,115 +1,131 @@
-name: Build Episode Titles
+name: Build IMDb Episode Titles
 
 on:
-  schedule:
-    - cron: '0 3 * * 1'
   workflow_dispatch:
+
+  schedule:
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-imdb-episode-titles
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
+
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          python-version: '3.11'
+          fetch-depth: 1
 
-      - name: Download IMDb
+      - name: Show disk information
+        shell: bash
         run: |
-          mkdir -p data
-          curl -L https://datasets.imdbws.com/title.basics.tsv.gz | gunzip -c > data/basics.tsv
-          curl -L https://datasets.imdbws.com/title.crew.tsv.gz | gunzip -c > data/crew.tsv
-          curl -L https://datasets.imdbws.com/title.principals.tsv.gz | gunzip -c > data/principals.tsv
-          curl -L https://datasets.imdbws.com/title.episode.tsv.gz | gunzip -c > data/episode.tsv
-          head -n 2 data/*.tsv
+          set -euo pipefail
+          df -h
 
-      - name: Build
+      - name: Download IMDb datasets
+        shell: bash
         run: |
-          python3 << 'PY'
-          import csv, json, os
-          from collections import defaultdict
-          import datetime
+          set -euo pipefail
 
-          OUT = "out/titles"
-          os.makedirs(OUT, exist_ok=True)
+          mkdir -p datasets
 
-          # episode.tsv -> parent, season, episode
-          ep_info = {}
-          with open("data/episode.tsv", encoding="utf-8") as f:
-              r = csv.DictReader(f, delimiter="\t")
-              for row in r:
-                  ep_info[row["tconst"]] = {
-                      "parentId": row["parentTconst"] if row["parentTconst"] != "\\N" else None,
-                      "seasonNumber": int(row["seasonNumber"]) if row["seasonNumber"] != "\\N" else None,
-                      "episodeNumber": int(row["episodeNumber"]) if row["episodeNumber"] != "\\N" else None,
-                  }
+          download() {
+            local name="$1"
 
-          crew = {}
-          with open("data/crew.tsv", encoding="utf-8") as f:
-              r = csv.DictReader(f, delimiter="\t")
-              for row in r:
-                  d = row["directors"].split(",")[:1] if row["directors"] != "\\N" else []
-                  w = row["writers"].split(",")[:2] if row["writers"] != "\\N" else []
-                  crew[row["tconst"]] = (d, w)
+            curl \
+              --fail \
+              --location \
+              --retry 5 \
+              --retry-delay 10 \
+              --output "datasets/${name}.gz" \
+              "https://datasets.imdbws.com/${name}.gz"
+          }
 
-          principals = defaultdict(list)
-          with open("data/principals.tsv", encoding="utf-8") as f:
-              r = csv.DictReader(f, delimiter="\t")
-              for row in r:
-                  if row["category"] not in ("actor", "actress"):
-                      continue
-                  if len(principals[row["tconst"]]) >= 3:
-                      continue
-                  principals[row["tconst"]].append(row["nconst"])
+          download "title.basics.tsv"
+          download "title.episode.tsv"
+          download "title.crew.tsv"
+          download "title.principals.tsv"
+          download "name.basics.tsv"
 
-          count = 0
-          with open("data/basics.tsv", encoding="utf-8") as f:
-              r = csv.DictReader(f, delimiter="\t")
-              for row in r:
-                  if row["titleType"] != "tvEpisode":
-                      continue
-                  tid = row["tconst"]
-                  info = ep_info.get(tid)
-                  if not info or not info["parentId"]:
-                      continue
+          echo "Downloaded files:"
+          du -h datasets/*
 
-                  shard = tid[2:4]
-                  d, w = crew.get(tid, ([], []))
+      - name: Build episode shards
+        shell: bash
+        # اسکریپت به‌صورت فایل جدا (build_episode_titles.py) توی ریشه‌ی همین
+        # ریپو نگه‌داری میشه، نه به‌صورت heredoc توی yaml. مزیتش: دیف/ویرایش
+        # راحت‌تر، syntax highlighting درست، و امکان اجرا/تست لوکال با
+        # `python3 build_episode_titles.py` بدون نیاز به کل ورک‌فلو.
+        run: |
+          set -euo pipefail
+          python3 build_episode_titles.py
 
-                  obj = {
-                      "id": tid,
-                      "title": row["primaryTitle"] if row["primaryTitle"] != "\\N" else None,
-                      "type": "tvEpisode",
-                      "parentId": info["parentId"],
-                      "seasonNumber": info["seasonNumber"],
-                      "episodeNumber": info["episodeNumber"],
-                      "startYear": int(row["startYear"]) if row["startYear"] != "\\N" else None,
-                      "runtime": int(row["runtimeMinutes"]) if row["runtimeMinutes"] != "\\N" else None,
-                      "genres": row["genres"].split(",") if row["genres"] != "\\N" else [],
-                      "directors": [{"id": x} for x in d],
-                      "writers": [{"id": x} for x in w],
-                      "actors": [{"id": x} for x in principals.get(tid, [])]
-                  }
-                  obj = {k: v for k, v in obj.items() if v not in (None, [], {}) or k in ("id", "parentId")}
+      - name: Show output information
+        shell: bash
+        run: |
+          set -euo pipefail
 
-                  dir_path = f"{OUT}/{shard}"
-                  os.makedirs(dir_path, exist_ok=True)
-                  with open(f"{dir_path}/{tid}.json", "w", encoding="utf-8") as out:
-                      json.dump(obj, out, ensure_ascii=False, separators=(",", ":"))
+          echo "Version information:"
+          cat out/version.json
+          echo
 
-                  count += 1
+          echo "Output size:"
+          du -sh out
 
-          with open("out/version.json", "w") as vf:
-              json.dump({"updated": datetime.datetime.utcnow().isoformat(), "count": count}, vf)
+          echo "Number of shard files:"
+          find out/episodes -type f -name '*.json' | wc -l
 
-          print(f"built {count} episodes")
-          PY
+          echo "Example shard files:"
+          find out/episodes -type f -name '*.json' | head -n 10 || true
 
-      - name: Deploy
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./out
-          publish_branch: gh-pages
+          echo "Disk information:"
+          df -h
+
+      - name: Remove temporary build files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf datasets
+          rm -f episodes-build.sqlite3
+          rm -f episodes-build.sqlite3-shm
+          rm -f episodes-build.sqlite3-wal
+          rm -f episodes-build.sqlite3-journal
+
+          df -h
+
+      - name: Deploy episodes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "IMDb Episode Titles Bot"
+          git config user.email "bot@users.noreply.github.com"
+
+          git checkout --orphan gh-pages
+
+          git rm -rf . || true
+
+          mv out/episodes ./episodes
+          mv out/version.json ./version.json
+
+          rm -rf out
+
+          touch .nojekyll
+
+          git add episodes version.json .nojekyll
+
+          git commit \
+            -m "Update IMDb episode-title shards"
+
+          git push \
+            --force \
+            origin gh-pages
