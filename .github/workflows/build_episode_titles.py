@@ -1,0 +1,944 @@
+import csv
+import datetime
+import gzip
+import json
+import shutil
+import sqlite3
+from pathlib import Path
+
+
+DATASET_DIRECTORY = Path("datasets")
+OUTPUT_DIRECTORY = Path("out")
+EPISODE_DIRECTORY = OUTPUT_DIRECTORY / "episodes"
+DATABASE_PATH = Path("episodes-build.sqlite3")
+
+# محدودیت‌های خروجی برای سبک‌تر شدن هر رکورد
+CAST_LIMIT = 5
+DIRECTOR_LIMIT = 1
+WRITER_LIMIT = 2
+
+# طول پیشوند شارد: هرچه بزرگ‌تر، فایل‌های کوچک‌تر ولی تعداد فایل بیشتر.
+# چون این ریپو فقط برای lookup مستقیمِ تک‌اپیزودی استفاده میشه (نه enumerate
+# کردن کل یک سریال)، تعداد فایل بیشتر هزینه‌ای نداره؛ فقط حجم هر دانلود مهمه.
+# با 4 رقم هر شارد میانگین چند هزار اپیزود داشت؛ با 5 رقم این عدد تقریباً /10
+# میشه. اگر باز هم سبک‌تر خواستی، این عدد رو به 6 ببر (فایل‌های خیلی کوچیک‌تر،
+# صدها هزار فایل که برای GitHub Pages مشکلی نداره، فقط push اولیه کمی کندتره).
+SHARD_PREFIX_LENGTH = 5
+
+DATABASE_BATCH_SIZE = 25_000
+NAME_QUERY_BATCH_SIZE = 800
+
+
+def clean_text(value):
+    if value in (None, "", r"\N"):
+        return None
+
+    return value
+
+
+def clean_int(value):
+    value = clean_text(value)
+
+    if value is None:
+        return None
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_genres(value):
+    value = clean_text(value)
+
+    if value is None:
+        return []
+
+    return [
+        genre
+        for genre in value.split(",")
+        if genre and genre != r"\N"
+    ]
+
+
+def parse_ids(value):
+    value = clean_text(value)
+
+    if value is None:
+        return []
+
+    return [
+        person_id
+        for person_id in value.split(",")
+        if person_id and person_id != r"\N"
+    ]
+
+
+def encode_json(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":")
+    )
+
+
+def open_dataset(filename):
+    handle = gzip.open(
+        DATASET_DIRECTORY / filename,
+        mode="rt",
+        encoding="utf-8",
+        newline=""
+    )
+
+    reader = csv.DictReader(
+        handle,
+        delimiter="\t"
+    )
+
+    return handle, reader
+
+
+def reset_build():
+    if OUTPUT_DIRECTORY.exists():
+        shutil.rmtree(OUTPUT_DIRECTORY)
+
+    OUTPUT_DIRECTORY.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    EPISODE_DIRECTORY.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    if DATABASE_PATH.exists():
+        DATABASE_PATH.unlink()
+
+
+def create_database():
+    connection = sqlite3.connect(
+        DATABASE_PATH,
+        timeout=120
+    )
+
+    connection.execute(
+        "PRAGMA journal_mode = OFF"
+    )
+
+    connection.execute(
+        "PRAGMA synchronous = OFF"
+    )
+
+    connection.execute(
+        "PRAGMA temp_store = MEMORY"
+    )
+
+    connection.execute(
+        "PRAGMA cache_size = -250000"
+    )
+
+    # locking_mode=EXCLUSIVE عمداً استفاده نشده است.
+
+    connection.execute("""
+        CREATE TABLE episodes (
+            tconst TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            original_title TEXT,
+            is_adult INTEGER NOT NULL DEFAULT 0,
+            start_year INTEGER,
+            end_year INTEGER,
+            runtime INTEGER,
+            genres TEXT NOT NULL DEFAULT '[]',
+
+            parent_id TEXT,
+            season_number INTEGER,
+            episode_number INTEGER,
+
+            directors TEXT NOT NULL DEFAULT '[]',
+            writers TEXT NOT NULL DEFAULT '[]',
+            actors TEXT NOT NULL DEFAULT '[]'
+        ) WITHOUT ROWID
+    """)
+
+    connection.execute("""
+        CREATE TABLE names (
+            nconst TEXT PRIMARY KEY,
+            primary_name TEXT NOT NULL
+        ) WITHOUT ROWID
+    """)
+
+    return connection
+
+
+def load_episodes(connection):
+    print(
+        "Loading tvEpisode rows from "
+        "title.basics..."
+    )
+
+    handle, reader = open_dataset(
+        "title.basics.tsv.gz"
+    )
+
+    sql = """
+        INSERT OR REPLACE INTO episodes (
+            tconst,
+            title,
+            original_title,
+            is_adult,
+            start_year,
+            end_year,
+            runtime,
+            genres
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    batch = []
+    count = 0
+
+    try:
+        for row in reader:
+            if row.get("titleType") != "tvEpisode":
+                continue
+
+            title_id = row["tconst"]
+
+            batch.append((
+                title_id,
+                clean_text(
+                    row.get("primaryTitle")
+                ) or title_id,
+                clean_text(
+                    row.get("originalTitle")
+                ),
+                1 if row.get("isAdult") == "1" else 0,
+                clean_int(row.get("startYear")),
+                clean_int(row.get("endYear")),
+                clean_int(
+                    row.get("runtimeMinutes")
+                ),
+                encode_json(
+                    parse_genres(
+                        row.get("genres")
+                    )
+                )
+            ))
+
+            if len(batch) >= DATABASE_BATCH_SIZE:
+                connection.executemany(sql, batch)
+                count += len(batch)
+                batch.clear()
+
+                if count % 250_000 == 0:
+                    print(
+                        f"  Episodes loaded: "
+                        f"{count:,}"
+                    )
+
+        if batch:
+            connection.executemany(sql, batch)
+            count += len(batch)
+
+        connection.commit()
+
+    finally:
+        handle.close()
+
+    print(f"Loaded {count:,} episodes.")
+
+    return count
+
+
+def load_episode_relations(connection):
+    print(
+        "Loading parent, season and "
+        "episode numbers..."
+    )
+
+    handle, reader = open_dataset(
+        "title.episode.tsv.gz"
+    )
+
+    sql = """
+        UPDATE episodes
+        SET
+            parent_id = ?,
+            season_number = ?,
+            episode_number = ?
+        WHERE tconst = ?
+    """
+
+    batch = []
+    count = 0
+
+    try:
+        for row in reader:
+            batch.append((
+                clean_text(
+                    row.get("parentTconst")
+                ),
+                clean_int(
+                    row.get("seasonNumber")
+                ),
+                clean_int(
+                    row.get("episodeNumber")
+                ),
+                row["tconst"]
+            ))
+
+            if len(batch) >= DATABASE_BATCH_SIZE:
+                connection.executemany(sql, batch)
+                count += len(batch)
+                batch.clear()
+
+                if count % 250_000 == 0:
+                    print(
+                        "  Episode relations "
+                        f"processed: {count:,}"
+                    )
+
+        if batch:
+            connection.executemany(sql, batch)
+            count += len(batch)
+
+        connection.commit()
+
+    finally:
+        handle.close()
+
+    print(
+        f"Processed {count:,} "
+        "episode relation rows."
+    )
+
+
+def load_crew(connection):
+    print(
+        "Loading episode directors "
+        "and writers..."
+    )
+
+    handle, reader = open_dataset(
+        "title.crew.tsv.gz"
+    )
+
+    sql = """
+        UPDATE episodes
+        SET
+            directors = ?,
+            writers = ?
+        WHERE tconst = ?
+    """
+
+    batch = []
+    count = 0
+
+    try:
+        for row in reader:
+            batch.append((
+                encode_json(
+                    parse_ids(
+                        row.get("directors")
+                    )
+                ),
+                encode_json(
+                    parse_ids(
+                        row.get("writers")
+                    )
+                ),
+                row["tconst"]
+            ))
+
+            if len(batch) >= DATABASE_BATCH_SIZE:
+                connection.executemany(sql, batch)
+                count += len(batch)
+                batch.clear()
+
+                if count % 500_000 == 0:
+                    print(
+                        f"  Crew rows processed: "
+                        f"{count:,}"
+                    )
+
+        if batch:
+            connection.executemany(sql, batch)
+            count += len(batch)
+
+        connection.commit()
+
+    finally:
+        handle.close()
+
+    print(
+        f"Processed {count:,} crew rows."
+    )
+
+
+def load_cast(connection):
+    print(
+        f"Loading top {CAST_LIMIT} cast "
+        "members for each episode..."
+    )
+
+    handle, reader = open_dataset(
+        "title.principals.tsv.gz"
+    )
+
+    sql = """
+        UPDATE episodes
+        SET actors = ?
+        WHERE tconst = ?
+    """
+
+    current_title_id = None
+    current_cast = []
+
+    update_batch = []
+    title_count = 0
+
+    def save_current_title():
+        nonlocal title_count
+
+        if current_title_id is None:
+            return
+
+        selected_cast = sorted(
+            current_cast,
+            key=lambda item: item[0]
+        )[:CAST_LIMIT]
+
+        actor_ids = [
+            person_id
+            for _, person_id in selected_cast
+        ]
+
+        update_batch.append((
+            encode_json(actor_ids),
+            current_title_id
+        ))
+
+        title_count += 1
+
+        if len(update_batch) >= DATABASE_BATCH_SIZE:
+            connection.executemany(
+                sql,
+                update_batch
+            )
+
+            update_batch.clear()
+
+            if title_count % 250_000 == 0:
+                print(
+                    "  Principal titles "
+                    f"processed: {title_count:,}"
+                )
+
+    try:
+        for row in reader:
+            title_id = row["tconst"]
+
+            if current_title_id is None:
+                current_title_id = title_id
+
+            elif title_id != current_title_id:
+                save_current_title()
+
+                current_title_id = title_id
+                current_cast = []
+
+            category = row.get("category")
+
+            if category not in (
+                "actor",
+                "actress",
+                "self"
+            ):
+                continue
+
+            if len(current_cast) >= CAST_LIMIT:
+                continue
+
+            person_id = clean_text(
+                row.get("nconst")
+            )
+
+            if person_id is None:
+                continue
+
+            ordering = clean_int(
+                row.get("ordering")
+            )
+
+            if ordering is None:
+                ordering = 999999
+
+            current_cast.append((
+                ordering,
+                person_id
+            ))
+
+        save_current_title()
+
+        if update_batch:
+            connection.executemany(
+                sql,
+                update_batch
+            )
+
+        connection.commit()
+
+    finally:
+        handle.close()
+
+    print(
+        "Processed principals for "
+        f"{title_count:,} titles."
+    )
+
+
+def load_names(connection):
+    print("Loading IMDb person names...")
+
+    handle, reader = open_dataset(
+        "name.basics.tsv.gz"
+    )
+
+    sql = """
+        INSERT OR REPLACE INTO names (
+            nconst,
+            primary_name
+        )
+        VALUES (?, ?)
+    """
+
+    batch = []
+    count = 0
+
+    try:
+        for row in reader:
+            person_id = clean_text(
+                row.get("nconst")
+            )
+
+            if person_id is None:
+                continue
+
+            person_name = clean_text(
+                row.get("primaryName")
+            ) or person_id
+
+            batch.append((
+                person_id,
+                person_name
+            ))
+
+            if len(batch) >= DATABASE_BATCH_SIZE:
+                connection.executemany(
+                    sql,
+                    batch
+                )
+
+                count += len(batch)
+                batch.clear()
+
+                if count % 500_000 == 0:
+                    print(
+                        f"  Names loaded: "
+                        f"{count:,}"
+                    )
+
+        if batch:
+            connection.executemany(
+                sql,
+                batch
+            )
+
+            count += len(batch)
+
+        connection.commit()
+
+    finally:
+        handle.close()
+
+    print(f"Loaded {count:,} names.")
+
+
+def get_shard_id(title_id):
+    # tt10680456 -> "10680" (با SHARD_PREFIX_LENGTH=5)
+    numeric_part = title_id[2:]
+
+    return numeric_part[:SHARD_PREFIX_LENGTH].ljust(
+        SHARD_PREFIX_LENGTH, "0"
+    )
+
+
+def get_shard_path(shard_id):
+    # shard "10680" -> episodes/10/10680.json
+    directory = (
+        EPISODE_DIRECTORY /
+        shard_id[:2]
+    )
+
+    directory.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    return directory / f"{shard_id}.json"
+
+
+def load_people_names(connection, person_ids):
+    unique_ids = list(set(person_ids))
+    names = {}
+
+    for start in range(
+        0,
+        len(unique_ids),
+        NAME_QUERY_BATCH_SIZE
+    ):
+        batch = unique_ids[
+            start:
+            start + NAME_QUERY_BATCH_SIZE
+        ]
+
+        if not batch:
+            continue
+
+        placeholders = ",".join(
+            "?"
+            for _ in batch
+        )
+
+        query = f"""
+            SELECT nconst, primary_name
+            FROM names
+            WHERE nconst IN ({placeholders})
+        """
+
+        for person_id, person_name in (
+            connection.execute(query, batch)
+        ):
+            names[person_id] = person_name
+
+    return names
+
+
+def write_shard(
+    connection,
+    shard_id,
+    rows
+):
+    if not rows:
+        return 0
+
+    all_person_ids = []
+
+    parsed_rows = []
+
+    for row in rows:
+        (
+            title_id,
+            title,
+            original_title,
+            is_adult,
+            start_year,
+            end_year,
+            runtime,
+            genres_json,
+            parent_id,
+            season_number,
+            episode_number,
+            directors_json,
+            writers_json,
+            actors_json
+        ) = row
+
+        # === اینجا محدودیت جدید اعمال میشه: 1 کارگردان، 2 نویسنده ===
+        directors = json.loads(
+            directors_json or "[]"
+        )[:DIRECTOR_LIMIT]
+
+        writers = json.loads(
+            writers_json or "[]"
+        )[:WRITER_LIMIT]
+
+        actors = json.loads(
+            actors_json or "[]"
+        )[:CAST_LIMIT]
+
+        all_person_ids.extend(directors)
+        all_person_ids.extend(writers)
+        all_person_ids.extend(actors)
+
+        parsed_rows.append((
+            title_id,
+            title,
+            original_title,
+            is_adult,
+            start_year,
+            end_year,
+            runtime,
+            json.loads(genres_json or "[]"),
+            parent_id,
+            season_number,
+            episode_number,
+            directors,
+            writers,
+            actors
+        ))
+
+    people_names = load_people_names(
+        connection,
+        all_person_ids
+    )
+
+    def make_people(person_ids):
+        return [
+            {
+                "id": person_id,
+                "name": people_names.get(
+                    person_id,
+                    person_id
+                )
+            }
+            for person_id in person_ids
+        ]
+
+    output = {}
+
+    for row in parsed_rows:
+        (
+            title_id,
+            title,
+            original_title,
+            is_adult,
+            start_year,
+            end_year,
+            runtime,
+            genres,
+            parent_id,
+            season_number,
+            episode_number,
+            directors,
+            writers,
+            actors
+        ) = row
+
+        output[title_id] = {
+            "id": title_id,
+            "title": title,
+            "originalTitle": original_title,
+            "type": "tvEpisode",
+            "adult": bool(is_adult),
+            "startYear": start_year,
+            "endYear": end_year,
+            "runtime": runtime,
+            "genres": genres,
+            "parentId": parent_id,
+            "seasonNumber": season_number,
+            "episodeNumber": episode_number,
+            "directors": make_people(
+                directors
+            ),
+            "writers": make_people(
+                writers
+            ),
+            "actors": make_people(
+                actors
+            )
+        }
+
+    output_path = get_shard_path(shard_id)
+
+    temporary_path = output_path.with_suffix(
+        ".json.tmp"
+    )
+
+    with temporary_path.open(
+        "w",
+        encoding="utf-8"
+    ) as output_file:
+        json.dump(
+            output,
+            output_file,
+            ensure_ascii=False,
+            separators=(",", ":")
+        )
+
+    temporary_path.replace(output_path)
+
+    return len(output)
+
+
+def write_episode_shards(connection):
+    print("Writing episode shard files...")
+
+    query = """
+        SELECT
+            tconst,
+            title,
+            original_title,
+            is_adult,
+            start_year,
+            end_year,
+            runtime,
+            genres,
+            parent_id,
+            season_number,
+            episode_number,
+            directors,
+            writers,
+            actors
+        FROM episodes
+        ORDER BY tconst
+    """
+
+    cursor = connection.execute(query)
+
+    current_shard_id = None
+    current_rows = []
+
+    episode_count = 0
+    shard_count = 0
+
+    for row in cursor:
+        title_id = row[0]
+        shard_id = get_shard_id(title_id)
+
+        if current_shard_id is None:
+            current_shard_id = shard_id
+
+        elif shard_id != current_shard_id:
+            written = write_shard(
+                connection,
+                current_shard_id,
+                current_rows
+            )
+
+            episode_count += written
+            shard_count += 1
+
+            if shard_count % 500 == 0:
+                print(
+                    f"  Shards written: "
+                    f"{shard_count:,}; "
+                    f"episodes: "
+                    f"{episode_count:,}"
+                )
+
+            current_shard_id = shard_id
+            current_rows = []
+
+        current_rows.append(row)
+
+    if current_rows:
+        written = write_shard(
+            connection,
+            current_shard_id,
+            current_rows
+        )
+
+        episode_count += written
+        shard_count += 1
+
+    print(
+        f"Finished writing "
+        f"{episode_count:,} episodes "
+        f"into {shard_count:,} shards."
+    )
+
+    return episode_count, shard_count
+
+
+def write_version_file(
+    episode_count,
+    shard_count
+):
+    version_data = {
+        "updated": datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat(),
+        "episodes": episode_count,
+        "shards": shard_count,
+        "castLimit": CAST_LIMIT,
+        "directorLimit": DIRECTOR_LIMIT,
+        "writerLimit": WRITER_LIMIT,
+        "formatVersion": 1,
+        "shardStrategy": f"tconst[2:{2 + SHARD_PREFIX_LENGTH}]",
+        "pathPattern": (
+            "episodes/{prefix}/"
+            "{shard}.json"
+        )
+    }
+
+    with (
+        OUTPUT_DIRECTORY /
+        "version.json"
+    ).open(
+        "w",
+        encoding="utf-8"
+    ) as output_file:
+        json.dump(
+            version_data,
+            output_file,
+            ensure_ascii=False,
+            separators=(",", ":")
+        )
+
+
+def main():
+    reset_build()
+
+    connection = create_database()
+
+    try:
+        expected_episode_count = load_episodes(
+            connection
+        )
+
+        load_episode_relations(connection)
+        load_crew(connection)
+        load_cast(connection)
+        load_names(connection)
+
+        episode_count, shard_count = (
+            write_episode_shards(connection)
+        )
+
+        if (
+            episode_count !=
+            expected_episode_count
+        ):
+            raise RuntimeError(
+                "Episode count mismatch: "
+                f"database="
+                f"{expected_episode_count:,}, "
+                f"output={episode_count:,}"
+            )
+
+        write_version_file(
+            episode_count,
+            shard_count
+        )
+
+    finally:
+        connection.close()
+
+    print("Build completed successfully.")
+    print(
+        f"Episodes: {episode_count:,}"
+    )
+    print(
+        f"Shards: {shard_count:,}"
+    )
+    print(
+        f"Cast limit: {CAST_LIMIT}, "
+        f"Director limit: {DIRECTOR_LIMIT}, "
+        f"Writer limit: {WRITER_LIMIT}"
+    )
+
+
+if __name__ == "__main__":
+    main()
