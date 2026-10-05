@@ -1,0 +1,1 @@
+{"updated":"2026-10-05T09:56:25.505699+00:00","episodes":9927689,"shards":97565,"castLimit":5,"directorLimit":1,"writerLimit":2,"formatVersion":1,"shardStrategy":"tconst[2:7]","pathPattern":"episodes/{prefix}/{shard}.json"}
